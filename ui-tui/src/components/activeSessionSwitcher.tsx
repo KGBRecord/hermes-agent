@@ -7,6 +7,7 @@ import type {
 } from '@hermes/shared/gateway-events'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
+import { mutateCanonical } from '../app/slash/canonicalSessionControls.js'
 import {
   DEFAULT_GROUP_VIEW,
   deriveSwitcherRows,
@@ -366,6 +367,8 @@ export function ActiveSessionSwitcher({
   const [query, setQuery] = useState('')
   const [searching, setSearching] = useState(false)
   const [err, setErr] = useState('')
+  // A close/delete failure: kept apart from `err`, which every quiet poll rewrites.
+  const [actionErr, setActionErr] = useState('')
   const [sel, setSel] = useState(0)
   const [loading, setLoading] = useState(true)
   const [draft, setDraft] = useState('')
@@ -439,13 +442,31 @@ export function ActiveSessionSwitcher({
         // Fetch independently (allSettled) so a failing session.list can't
         // wipe the live-session list: live sessions still render and the
         // resumable history degrades on its own.
+        const canonicalList = gw.isCanonical
+          ? gw.request<{ scope?: string; sessions?: (SessionListRow & { running?: boolean })[] }>('session.list', {
+              limit: 200
+            })
+          : null
+
         const [liveRes, histRes, treeRes] = await Promise.allSettled([
-          gw.request<SessionActiveListResponse>('session.active_list', {
-            current_session_id: currentSessionId
-          }),
-          includeHistory ? gw.request<SessionListResult>('session.list', { limit: 200 }) : Promise.resolve(null),
-          // Grouping is decoration: a failing tree degrades to the flat list.
+          canonicalList
+            ? canonicalList.then(value => ({
+                sessions: value.sessions?.map(row => ({
+                  ...row,
+                  current: row.id === currentSessionId,
+                  status: row.running ? ('working' as const) : ('idle' as const)
+                }))
+              }))
+            : gw.request<SessionActiveListResponse>('session.active_list', { current_session_id: currentSessionId }),
           includeHistory
+            ? gw.request<SessionListResult>('session.list', {
+                limit: 200,
+                ...(canonicalList ? { scope: 'stored' } : {})
+              })
+            : Promise.resolve(null),
+          // Grouping is decoration: a failing tree degrades to the flat list. The shared
+          // (canonical) gateway has no `projects.tree`, so the picker stays flat there.
+          includeHistory && !gw.isCanonical
             ? gw.request<ProjectsTreeResult>('projects.tree', {
                 preview_limit: 1,
                 session_limit: PROJECT_TREE_SESSION_LIMIT
@@ -579,7 +600,7 @@ export function ActiveSessionSwitcher({
       return
     }
 
-    setErr('')
+    setActionErr('')
     setClosingId(target.id)
 
     try {
@@ -587,7 +608,7 @@ export function ActiveSessionSwitcher({
       const closed = Boolean(result?.closed ?? result?.ok)
 
       if (!closed) {
-        setErr(messages().pickers.session.errors.alreadyClosed)
+        setActionErr(messages().pickers.session.errors.alreadyClosed)
 
         return
       }
@@ -603,7 +624,7 @@ export function ActiveSessionSwitcher({
         setSel(s => Math.max(0, Math.min(s, rows.length - 1)))
       }
     } catch (e: unknown) {
-      setErr(rpcErrorMessage(e))
+      setActionErr(rpcErrorMessage(e))
     } finally {
       setClosingId('')
     }
@@ -618,12 +639,22 @@ export function ActiveSessionSwitcher({
       }
 
       setDeleting(true)
-      gw.request<SessionDeleteResponse>('session.delete', { session_id: target.id })
-        .then(raw => {
-          const r = asRpcResult<SessionDeleteResponse>(raw)
+      setActionErr('')
 
-          if (!r || r.deleted !== target.id) {
-            setErr(messages().pickers.common.invalidResponse('session.delete'))
+      // The shared gateway has no `session.delete`: its delete is the revision-fenced
+      // `session.mutate operation=delete` (the whole lineage), as the classic CLI sends it.
+      const deleted = gw.isCanonical
+        ? mutateCanonical(gw, target.id, 'delete', {}).then(mutation => Boolean(mutation?.result))
+        : gw
+            .request<SessionDeleteResponse>('session.delete', { session_id: target.id })
+            .then(raw => asRpcResult<SessionDeleteResponse>(raw)?.deleted === target.id)
+
+      deleted
+        .then(ok => {
+          if (!ok) {
+            setActionErr(
+              messages().pickers.common.invalidResponse(gw.isCanonical ? 'session.mutate' : 'session.delete')
+            )
             setDeleting(false)
 
             return
@@ -634,11 +665,10 @@ export function ActiveSessionSwitcher({
           setHistory(derived.hist)
           setHistoryGroups(derived.groups)
           setSel(s => Math.max(0, Math.min(s, rows.length - 1)))
-          setErr('')
           setDeleting(false)
         })
         .catch((e: unknown) => {
-          setErr(rpcErrorMessage(e))
+          setActionErr(rpcErrorMessage(e))
           setDeleting(false)
         })
     },
@@ -797,7 +827,7 @@ export function ActiveSessionSwitcher({
       </Text>
       <Text color={t.color.muted}>{sessionsCountLabel(items.length, history.length)}</Text>
 
-      {err && <Text color={t.color.label}>{C.error(err)}</Text>}
+      {(actionErr || err) && <Text color={t.color.label}>{C.error(actionErr || err)}</Text>}
 
       {(searching || query) && (
         <SearchLine
