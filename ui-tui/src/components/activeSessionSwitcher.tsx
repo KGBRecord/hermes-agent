@@ -7,7 +7,6 @@ import type {
 } from '@hermes/shared/gateway-events'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
-import { mutateCanonical } from '../app/slash/canonicalSessionControls.js'
 import {
   DEFAULT_GROUP_VIEW,
   deriveSwitcherRows,
@@ -22,12 +21,8 @@ import {
 import { sessionScopedModelArg } from '../domain/slash.js'
 import { type SwitcherIntent, switcherKeyIntent, type SwitcherRowKind } from '../domain/switcherKeys.js'
 import type { GatewayClient } from '../gatewayClient.js'
-import type {
-  SessionActiveItem,
-  SessionActiveListResponse,
-  SessionCloseResponse,
-  SessionDeleteResponse
-} from '../gatewayTypes.js'
+import type { SessionActiveItem, SessionActiveListResponse, SessionCloseResponse } from '../gatewayTypes.js'
+import { useSessionDelete } from '../hooks/useSessionDelete.js'
 import { messages } from '../i18n/runtime.js'
 import { useT } from '../i18n/useT.js'
 import { asRpcResult, rpcErrorMessage } from '../lib/rpc.js'
@@ -380,7 +375,6 @@ export function ActiveSessionSwitcher({
   // the 1.5s live-status poll re-indexing rows can't redirect the delete to a
   // different session. Any other key cancels the prompt.
   const [confirmDelete, setConfirmDelete] = useState<null | string>(null)
-  const [deleting, setDeleting] = useState(false)
   const T = useT()
   const S = T.pickers.session
   const C = T.pickers.common
@@ -636,49 +630,16 @@ export function ActiveSessionSwitcher({
     }
   }, [closingId, currentSessionId, gw.isCanonical, load, onClose, onNew, onSelect, rows, sel])
 
-  const performDelete = useCallback(
+  const removeDeleted = useCallback(
     (id: string) => {
-      const target = history.find(h => h.id === id)
+      rawHistoryRef.current = rawHistoryRef.current.filter(h => h.id !== id)
 
-      if (!target || deleting) {
-        return
-      }
-
-      setDeleting(true)
-      setActionErr('')
-
-      // The shared gateway has no `session.delete`: its delete is the revision-fenced
-      // `session.mutate operation=delete` (the whole lineage), as the classic CLI sends it.
-      const deleted = gw.isCanonical
-        ? mutateCanonical(gw, target.id, 'delete', {}).then(mutation => Boolean(mutation?.result))
-        : gw
-            .request<SessionDeleteResponse>('session.delete', { session_id: target.id })
-            .then(raw => asRpcResult<SessionDeleteResponse>(raw)?.deleted === target.id)
-
-      deleted
-        .then(ok => {
-          if (!ok) {
-            setActionErr(
-              messages().pickers.common.invalidResponse(gw.isCanonical ? 'session.mutate' : 'session.delete')
-            )
-            setDeleting(false)
-
-            return
-          }
-
-          rawHistoryRef.current = rawHistoryRef.current.filter(h => h.id !== target.id)
-          const derived = deriveHistory(items)
-          setHistory(derived.hist)
-          setHistoryGroups(derived.groups)
-          setSel(s => Math.max(0, Math.min(s, rows.length - 1)))
-          setDeleting(false)
-        })
-        .catch((e: unknown) => {
-          setActionErr(rpcErrorMessage(e))
-          setDeleting(false)
-        })
+      const derived = deriveHistory(items)
+      setHistory(derived.hist)
+      setHistoryGroups(derived.groups)
+      setSel(s => Math.max(0, Math.min(s, rows.length - 1)))
     },
-    [deleting, deriveHistory, gw, history, items, rows.length]
+    [deriveHistory, items, rows.length]
   )
 
   const cycleGroupView = useCallback((group: SessionGroup<SessionListRow>) => {
@@ -725,9 +686,18 @@ export function ActiveSessionSwitcher({
     [cycleGroupView, onResume, onSelect]
   )
 
+  const keepView = useCallback((resolved: string) => resolved === currentSessionId, [currentSessionId])
+  const { deletePending, deleting, performDelete } = useSessionDelete(gw, removeDeleted, setActionErr, keepView)
+
   const handleRowClick = useCallback(
     (index: number) => (event: { stopImmediatePropagation?: () => void }) => {
       event.stopImmediatePropagation?.()
+
+      // Keys are held while a delete is pending; a click must not open the row mid-delete either.
+      if (deletePending()) {
+        return
+      }
+
       const row = rows[index - 1]
 
       setSel(row ? Math.max(0, Math.min(index, total - 1)) : 0)
@@ -736,7 +706,7 @@ export function ActiveSessionSwitcher({
         activateRow(row)
       }
     },
-    [activateRow, rows, total]
+    [activateRow, deletePending, rows, total]
   )
 
   const onQueryChange = useCallback((value: string) => {
@@ -757,10 +727,7 @@ export function ActiveSessionSwitcher({
     'close-live': () => void closeSelected(),
     'delete-confirm': () => {
       setConfirmDelete(null)
-
-      if (confirmDelete !== null) {
-        performDelete(confirmDelete)
-      }
+      performDelete(history.find(h => h.id === confirmDelete))
     },
     'delete-dismiss': () => setConfirmDelete(null),
     down: () => setSel(s => Math.min(total - 1, s + 1)),
@@ -781,7 +748,7 @@ export function ActiveSessionSwitcher({
   useInput((ch, key) => {
     const intent = switcherKeyIntent(
       {
-        busy: pickingModel || deleting,
+        busy: pickingModel || deletePending(),
         canMoveDown: sel < total - 1,
         canMoveUp: sel > 0,
         confirmingDelete: confirmDelete !== null,
